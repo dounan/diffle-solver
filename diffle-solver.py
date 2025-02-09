@@ -225,7 +225,7 @@ if __name__ == "__main__":
         except:
             pass
 
-        guess_html = input("Enter guess result html: ")
+        guess_html = input("What was the result? Enter the HTML of the div with class 'guess': ")
         rules = parse_guess_results(guess_html)
         remaining_words_before_count = len(remaining_words)
         remaining_words = filter_words(remaining_words, rules)
