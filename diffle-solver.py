@@ -173,7 +173,7 @@ def parse_guess_results(html: str) -> list:
         if "absent" in classes:
             # Check equal to 0 as well so we explicitly set a 0 count for the letter, which will allow us to create a rule for it later.
             if occurrence_count[letter] >= 0:
-              # Use negative occurrence to mark exact
+              # Use negative occurrence to mark that the occurrence count is an exact count (cannot be more).
               occurrence_count[letter] = -occurrence_count[letter]
         else:
             occurrence_count[letter] += 1
