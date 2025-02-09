@@ -1,5 +1,4 @@
 """
-
 # Game Instructions
 
 - Given a list of all valid words and a hidden randomly selected word
@@ -11,82 +10,29 @@
   - The letter is present and is a continuation of the previous letter
   - The letter is beginning of the hidden word.
   - The letter is the end of the word.
-
-# Available information
-- allWords
-- remainingWords
-- remainingLetters (letters not attempted)
-- for each attempted letter
-  - exactly N occurrences (including 0)
-  - possibly N or more occurrences
-  - invalid ordering
-- connected letters
-- starting letter / sequence
-- ending letter / sequence
-
-# Constraints
-1. Letters not in the word
-2. Letters in the word
-3. Letter in the wrong order
-3. Ordering, connected words, beginning and end
-
-# Algorithm
-
-If there is only 1 remainingWords, pick that one
-If there is only 2 remainingWords, pick one at random
-Otherwise pick a guess from allWords that has highest score (i.e. highest chance of removing the most words in remainingWords)
-
-To score a guess:
-- For each unique letter in the guess
-  - Add to the score the number of words in remainingWords the letter shows up in (will be 0 for invalid absent letters)
-    - Reasoning: if we try a letter and find it is invalid, it removes the most remainingWords
-- See how many constraints this word can update
-  - Add to the score the number of invalid ordered letter that are moved to a different ordering
-    - Can also try scoring by number of remainingWords that will be removed if the new ordering is correct
-  - Add 1 to the score if the start of the word has not been found yet and the guess has the first valid letter as the first letter
-    - Can also try scoring by number of remainingWords that will be removed if the starting sequence was valid
-  - Add 1 to the score if the end of the word has not been found yet and the guess has the last valid letter as the last letter
-    - Can also try scoring by number of remainingWords that will be removed
-  - Add to the score the number of new groupings of valid ordering (e.g. if we know A*G*L, and the word has "AGL", that is two new groupings)
-- Subtract the score by number of invalid letters used (letters used beyond the number of occurrences allowed)
-
-# Modeling
-
-allWords: [string]
-remainingWords: [string]
-remainingLetters: {char: integer}
-  - Maps a letter to number of words in remainingWords that has the letter
-letterOccurrences: {char: [int, bool]}
-  - Maps a letter to [number of occurrences, finalized]. If finalized is false, there is a chance there could be more occurrences
-ordering: [string]
-  - Each element in the array is a string that starts with a letter:
-    - Lower case letter: valid letter and in correct ordering, but could have more occurrences in the word that haven't been found yet
-    - Upper case letter: valid letter and all occurrences of the letter have been found
-  - The string is then followed by one or more special characters:
-    - "^" -- start of the word
-    - "$" -- end of the word
-    - "~" -- a continuation
-    - "?" -- position is incorrect
-    - "!" -- tombstone for incorrect position, but the correct positions for all occurrences of the letter has been found and are presents in other parts of the `ordering` array
 """
 
-from abc import ABC, abstractmethod
-from bs4 import BeautifulSoup
+#!/usr/bin/env python3
 import csv
-import re
-import string
+import collections
+from abc import ABC, abstractmethod
+from concurrent.futures import ProcessPoolExecutor
+from bs4 import BeautifulSoup
 
+# -------------------------
+# Data Model and Rule Classes
+# -------------------------
 class Word:
     def __init__(self, word: str):
         self.word = word
-        self.letter_count = {}
+        # Use collections.Counter for efficient letter counting
+        self.letter_count = collections.Counter(word)
         self.guess_rules = []
-
+        # Create rules based on letter occurrences, tracking the count as we progress in the word
+        occurrences = {}
         for letter in word:
-            new_count = self.letter_count.get(letter, 0) + 1
-            self.letter_count[letter] = new_count
-            self.guess_rules.append(LetterOccurrenceRule(letter, new_count, exact=False))
-
+            occurrences[letter] = occurrences.get(letter, 0) + 1
+            self.guess_rules.append(LetterOccurrenceRule(letter, occurrences[letter], exact=False))
         self.guess_rules.append(LetterStartRule(word[0]))
         self.guess_rules.append(LetterEndRule(word[-1]))
 
@@ -99,10 +45,6 @@ class Rule(ABC):
         pass
 
 class LetterOccurrenceRule(Rule):
-    letter: string
-    num_occurrences: int
-    exact: bool # false if word can have more occurrences of the letter
-
     def __init__(self, letter: str, num_occurrences: int, exact: bool):
         self.letter = letter
         self.num_occurrences = num_occurrences
@@ -110,141 +52,191 @@ class LetterOccurrenceRule(Rule):
 
     def matches(self, word: Word) -> bool:
         actual_occurrences = word.letter_count.get(self.letter, 0)
-        return self.num_occurrences == actual_occurrences if self.exact else self.num_occurrences <= actual_occurrences
+        return (actual_occurrences == self.num_occurrences) if self.exact else (actual_occurrences >= self.num_occurrences)
+
+    def __repr__(self):
+        return f"LetterOccurrenceRule({self.letter}, {self.num_occurrences}, exact={self.exact})"
 
 class LetterStartRule(Rule):
-    letter: string
-
     def __init__(self, letter: str):
         self.letter = letter
 
     def matches(self, word: Word) -> bool:
         return word.word.startswith(self.letter)
 
-class LetterEndRule(Rule):
-    letter: string
+    def __repr__(self):
+        return f"LetterStartRule({self.letter})"
 
+class LetterEndRule(Rule):
     def __init__(self, letter: str):
         self.letter = letter
 
     def matches(self, word: Word) -> bool:
         return word.word.endswith(self.letter)
 
-def load_words(filename):
+    def __repr__(self):
+        return f"LetterEndRule({self.letter})"
+
+# -------------------------
+# File and Word List Processing
+# -------------------------
+def load_words(filename: str) -> list:
     with open(filename, mode='r') as file:
         csv_reader = csv.reader(file)
-        data_array = []
-        for row in csv_reader:
-            data_array.append(row)
+        data_array = list(csv_reader)
     return data_array[0]
 
 def clean_words(words: list) -> list:
-    # Diffle only allows 10 letter words
+    # Diffle only allows words of up to 10 letters.
     return [word for word in words if len(word) <= 10]
 
 def init_words(words: list) -> list:
     return [Word(word) for word in words]
 
-# Splits every list of words inside word_lists into two lists, one with words where Rule is true and one where it is false.
+# -------------------------
+# Game Scoring and Rule Application
+# -------------------------
 def split_by_rule(word_lists: list, rule: Rule) -> list:
     result = []
     for word_list in word_lists:
-        false_group = [word for word in word_list if not rule.matches(word)]
-        true_group = [word for word in word_list if rule.matches(word)]
-        if len(false_group) > 0:
+        true_group = []
+        false_group = []
+        for word in word_list:
+            match = rule.matches(word)
+            if match:
+                true_group.append(word)
+            else:
+                false_group.append(word)
+        if false_group:
             result.append(false_group)
-        if len(true_group) > 0:
+        if true_group:
             result.append(true_group)
     return result
 
-# Computes the maximum possible remaining_words after guessing the word
-def get_max_remaining_after_guessing(guess_word: Word, remaining_words: list):
+def get_max_remaining_after_guessing(guess_word: Word, remaining_words: list) -> int:
+    """For a given guess word, compute the worst-case scenario: maximum number of remaining words across rule splits."""
     word_lists = [remaining_words]
     for rule in guess_word.guess_rules:
         word_lists = split_by_rule(word_lists, rule)
     return max(len(group) for group in word_lists)
 
-def score_guess(guess_word: Word, remaining_words: list) -> tuple[int, int]:
+def score_guess(guess_word: Word, remaining_words: list) -> tuple:
+    """
+    Returns a tuple score:
+      - First element: worst-case remaining words count (lower is better)
+      - Second element: length of the guess word (lower is better when counts are equal)
+    """
     return (get_max_remaining_after_guessing(guess_word, remaining_words), len(guess_word.word))
 
-def get_next_guess(all_words: list, remaining_words: list) -> Word:
-    scored_words = [(word, score_guess(word, remaining_words)) for word in all_words]
-    min_score_word = min(scored_words, key=lambda x: x[1])
-    print(f"[debug] get_next_guess: {min_score_word}")
-    return min_score_word[0]
+# Worker function for processing a batch of words
+def compute_scores_batch(args):
+    words_batch, remaining_words = args
+    results = []
+    for word in words_batch:
+        score = score_guess(word, remaining_words)
+        # print(f"[debug] finished compute_score: {word}, {score}")
+        results.append((word, score))
+    return results
 
+# Returns the next Word to guess along with the score (lower score is better).
+# The score is (max_remaining_word_count_after_guess, length_of_guess_word)
+def get_next_guess(all_words: list, remaining_words: list) -> tuple[Word, tuple[int, int]]:
+    # Base cases when there is <= 2 remaining words
+    if len(remaining_words) == 0:
+        raise ValueError("No more remaining words!")
+    if len(remaining_words) == 1:
+        return (remaining_words[0], (0, len(remaining_words[0].word)))
+    if len(remaining_words) == 2:
+        if len(remaining_words[0].word) < len(remaining_words[1].word):
+            return (remaining_words[0], (1, len(remaining_words[0].word)))
+        else:
+            return (remaining_words[1], (1, len(remaining_words[1].word)))
+
+    # Create batches of words to minimize overhead of creating tasks for process pools
+    BATCH_SIZE = 1000
+    batches = [all_words[i:i+BATCH_SIZE] for i in range(0, len(all_words), BATCH_SIZE)]
+    results = []
+    with ProcessPoolExecutor() as executor:
+        for batch_result in executor.map(compute_scores_batch, ((batch, remaining_words) for batch in batches)):
+            results.extend(batch_result)
+    return min(results, key=lambda x: x[1])
+
+# Returns a list of Rules
+def parse_guess_results(html: str) -> list:
+    soup = BeautifulSoup(html, 'html.parser')
+    rules = []
+    occurrence_count = collections.Counter()
+    for letter_div in soup.find_all(class_="letter"):
+        letter = letter_div.get_text()
+        classes = set(letter_div.get("class", []))
+
+        if "absent" in classes:
+            # Check equal to 0 as well so we explicitly set a 0 count for the letter, which will allow us to create a rule for it later.
+            if occurrence_count[letter] >= 0:
+              # Use negative occurrence to mark exact
+              occurrence_count[letter] = -occurrence_count[letter]
+        else:
+            occurrence_count[letter] += 1
+
+        if "start" in classes:
+            rules.append(LetterStartRule(letter))
+        if "end" in classes:
+            rules.append(LetterEndRule(letter))
+
+        # TODO: handle positional information (present, head, tail)
+        # if "present" in classes:
+        # if "head" in classes:
+        #     if len(possible_sequence > 0):
+        #         regex_filters.append(f"{re.escape(possible_sequence)}")
+        #     possible_sequence = letter
+        # elif "tail" in classes:
+        #     possible_sequence = f"{possible_sequence}{letter}"
+
+    for letter, count in occurrence_count.items():
+        rules.append(LetterOccurrenceRule(letter, abs(count), exact=(count <= 0)))
+
+    return rules
+
+# Returns a list of words that satisfy all the rules in the rules list.
+def filter_words(words: list, rules: list) -> list:
+    return [word for word in words if all(rule.matches(word) for rule in rules)]
+
+# -------------------------
+# Main Interactive Loop
+# -------------------------
 if __name__ == "__main__":
-    all_words = init_words(clean_words(load_words('allowed.csv')))
-    # No need to clean answers since they are guaranteed to be valid
-    remaining_words = init_words(load_words('answers.csv'))
+    allowed_words = clean_words(load_words('allowed.csv'))
+    answer_words = load_words('answers.csv')  # Answers are guaranteed valid so no cleaning needed
+
+    all_words = init_words(allowed_words)
+    remaining_words = init_words(answer_words)
+
+    # Precomputed first guess should be "centralise"
+    guess_word = Word("centralise")
+
     while True:
-      guess_word = get_next_guess(all_words, remaining_words)
-      print(f"Recommended guess: {guess_word}")
-      guess_html = input("Enter guess result html: ")
-      # guess_results = parse_guess_results(guess_html)
-      # unattempted_letters = update_unattempted_letters(unattempted_letters, guess[0])
-      # regex_filters = build_regex_filters(guess_results)
-      # TODO: filter remaining_words by regex_filters. each word has to satisfy all regexes
+        print(f"Recommended guess: {guess_word}")
+        try:
+          remaining_words.remove(guess_word)
+        except:
+            pass
+        try:
+          all_words.remove(guess_word)
+        except:
+            pass
 
+        guess_html = input("Enter guess result html: ")
+        rules = parse_guess_results(guess_html)
+        remaining_words_before_count = len(remaining_words)
+        remaining_words = filter_words(remaining_words, rules)
+        print(f"Remaining words filtered from {remaining_words_before_count} to {len(remaining_words)}")
+        if len(remaining_words) < 10:
+            print(remaining_words)
 
+        remaining_word_guess, remaining_word_score = get_next_guess(remaining_words, remaining_words)
+        all_words_guess, all_words_score = get_next_guess(all_words, remaining_words)
+        guess_word = all_words_guess if all_words_score < remaining_word_score else remaining_word_guess
 
-
-
-
-
-
-
-
-# def get_letter_scores(letters: set, words: list) -> dict:
-#     letter_counts = {letter: 0 for letter in letters}
-#     for word in words:
-#         unique_letters_in_word = set(word)
-#         for letter in letters:
-#             if letter in unique_letters_in_word:
-#                 letter_counts[letter] += 1
-#     return letter_counts
-
-# def score_word(word: str, letter_scores: dict) -> int:
-#     return sum(letter_scores.get(letter, 0) for letter in set(word))
-
-# def rank_words(words: list, letter_scores: dict) -> list:
-#     return sorted(((word, score_word(word, letter_scores)) for word in words), key=lambda x: x[1], reverse=True)
-
-# def get_next_guess(all_words: list, remaining_words: list, unattempted_letters: set) -> str:
-#     unattempted_letters_scores = get_letter_scores(unattempted_letters, remaining_words)
-#     scored_words = rank_words(all_words, unattempted_letters_scores)
-#     return scored_words[0]
-
-# # Returns a list of Rules
-# def parse_guess_results(html: str) -> list:
-#     soup = BeautifulSoup(html, 'html.parser')
-#     parsed_letters = []
-#     for letter_div in soup.find_all(class_="letter"):
-#         letter = letter_div.get_text()
-#         classes = [cls for cls in letter_div.get("class", []) if cls != "letter"]
-#         parsed_letters.append((letter, set(classes)))
-#     return parsed_letters
-
-# def build_regex_filters(guess_results: list) -> list:
-#   regex_filters = []
-#   possible_sequence = ""
-#   for i, (letter, classes) in enumerate(guess_results):
-#     if "absent" in classes:
-#         if len(possible_sequence > 0):
-#             regex_filters.append(f"{re.escape(possible_sequence)}")
-#         regex_filters.append(re.compile(f"^[^{re.escape(letter)}]*$"))
-#         possible_sequence = ""
-#     elif "start" in classes:
-#         regex_filters.append(re.compile(f"^{re.escape(letter)}"))
-#     elif "end" in classes:
-#         regex_filters.append(re.compile(f"{re.escape(letter)}$"))
-#     elif "head" in classes:
-#         if len(possible_sequence > 0):
-#             regex_filters.append(f"{re.escape(possible_sequence)}")
-#         possible_sequence = letter
-#     elif "tail" in classes:
-#         possible_sequence = f"{possible_sequence}{letter}"
-
-# def update_unattempted_letters(letters: set, guess: str) -> set:
-#     guess_letters = set(guess)
-#     return {letter for letter in letters if letter not in guess_letters}
+        print(f"[debug] remaining_word_guess: {remaining_word_guess}, score: {remaining_word_score}")
+        print(f"[debug] all_words_guess: {all_words_guess}, score: {all_words_score}")
+        print(f"[debug] guess_word: {guess_word}")
