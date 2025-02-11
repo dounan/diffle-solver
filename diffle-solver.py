@@ -10,6 +10,13 @@
   - The letter is present and is a continuation of the previous letter
   - The letter is beginning of the hidden word.
   - The letter is the end of the word.
+
+# Algorithm
+
+The algorithm works by simulating what feedback each potential guess would produce and measuring how much that guess would narrow down the candidate pool.
+1. Evaluate every possible valid guess by predicting how the feedback would partition the remaining candidate words.
+2. The guess that, in the worst-case scenario, leaves the fewest candidates is selected as the next guess.
+3. Given the feedback from the game of the guess, remove invalid candidate words.
 """
 
 #!/usr/bin/env python3
@@ -81,22 +88,31 @@ class LetterEndRule(Rule):
 # File and Word List Processing
 # -------------------------
 def load_words(filename: str) -> list:
+    """Read a CSV file and return the first row as a list of strings."""
     with open(filename, mode='r') as file:
         csv_reader = csv.reader(file)
         data_array = list(csv_reader)
     return data_array[0]
 
 def clean_words(words: list) -> list:
+    """Filter the provided list of words to only valid Diffle input words."""
     # Diffle only allows words of up to 10 letters.
     return [word for word in words if len(word) <= 10]
 
 def init_words(words: list) -> list:
+    """Convert a list of strings into a list of Word objects."""
     return [Word(word) for word in words]
 
 # -------------------------
 # Game Scoring and Rule Application
 # -------------------------
 def split_by_rule(word_lists: list, rule: Rule) -> list:
+    """
+    Split each word list into two lists, one where all words matches the given
+    rule, and one where they don't.
+
+    Return an updated list of word lists with empty word lists removed.
+    """
     result = []
     for word_list in word_lists:
         true_group = []
@@ -114,33 +130,54 @@ def split_by_rule(word_lists: list, rule: Rule) -> list:
     return result
 
 def get_max_remaining_after_guessing(guess_word: Word, remaining_words: list) -> int:
-    """For a given guess word, compute the worst-case scenario: maximum number of remaining words across rule splits."""
+    """
+    For a given guess word, return the maximum number of possible remaining
+    words after making the guess.
+    """
     word_lists = [remaining_words]
     for rule in guess_word.guess_rules:
         word_lists = split_by_rule(word_lists, rule)
     return max(len(group) for group in word_lists)
 
-def score_guess(guess_word: Word, remaining_words: list) -> tuple:
+def compute_score(guess_word: Word, remaining_words: list) -> tuple:
     """
-    Returns a tuple score:
-      - First element: worst-case remaining words count (lower is better)
-      - Second element: length of the guess word (lower is better when counts are equal)
+    Return the score of the guess word, where lower lexicographical scores are
+    better.
+
+    The score prioritizes words that reduce the max possible remaining words
+    after making the guess, and then by the guess word length.
     """
     return (get_max_remaining_after_guessing(guess_word, remaining_words), len(guess_word.word))
 
-# Worker function for processing a batch of words
-def compute_scores_batch(args):
+def compute_scores_batch(args: tuple[list, list]) -> list:
+    """
+    Worker function for scoring a batch of guess words.
+
+    Parameters:
+    args -- a tuple with a list of guess words and list of remaining words.
+
+    Return a list of tuples (Word, compute_score(Word)).
+    """
     words_batch, remaining_words = args
     results = []
     for word in words_batch:
-        score = score_guess(word, remaining_words)
+        score = compute_score(word, remaining_words)
         # print(f"[debug] finished compute_score: {word}, {score}")
         results.append((word, score))
     return results
 
-# Returns the next Word to guess along with the score (lower score is better).
-# The score is (max_remaining_word_count_after_guess, length_of_guess_word)
 def get_next_guess(all_words: list, remaining_words: list) -> tuple[Word, tuple[int, int]]:
+    """
+    Select the next guess word from either all_words or remaining_words.
+
+    Parameters:
+    all_words -- list of all allowed Word objects.
+    remaining_words -- list of remaining candidate Word objects.
+
+    Return the next guess as a tuple of (Word, compute_score(Word)).
+
+    Raise ValueError if there are no remaining words.
+    """
     # Base cases when there is <= 2 remaining words
     if len(remaining_words) == 0:
         raise ValueError("No more remaining words!")
@@ -152,7 +189,7 @@ def get_next_guess(all_words: list, remaining_words: list) -> tuple[Word, tuple[
         else:
             return (remaining_words[1], (1, len(remaining_words[1].word)))
 
-    # Create batches of words to minimize overhead of creating tasks for process pools
+    # Batch words into a single task to minimize overhead of creating too many executor tasks.
     BATCH_SIZE = 1000
     batches = [all_words[i:i+BATCH_SIZE] for i in range(0, len(all_words), BATCH_SIZE)]
     results = []
@@ -161,8 +198,13 @@ def get_next_guess(all_words: list, remaining_words: list) -> tuple[Word, tuple[
             results.extend(batch_result)
     return min(results, key=lambda x: x[1])
 
-# Returns a list of Rules
 def parse_guess_results(html: str) -> list:
+    """
+    Parse the HTML of the guess result (div with "guess" class) from the
+    Diffle UI.
+
+    Return a list of Rules to filter the remaining words by.
+    """
     soup = BeautifulSoup(html, 'html.parser')
     rules = []
     occurrence_count = collections.Counter()
@@ -197,8 +239,9 @@ def parse_guess_results(html: str) -> list:
 
     return rules
 
-# Returns a list of words that satisfy all the rules in the rules list.
+
 def filter_words(words: list, rules: list) -> list:
+    """Return a list of words that satisfy all the given rules."""
     return [word for word in words if all(rule.matches(word) for rule in rules)]
 
 # -------------------------
@@ -211,7 +254,8 @@ if __name__ == "__main__":
     all_words = init_words(allowed_words)
     remaining_words = init_words(answer_words)
 
-    # Precomputed first guess should be "centralise"
+    # The first guess word is always the same, and is precomputed by calling
+    # `get_next_guess` with the full set of `all_words` and `remaining_words`.
     guess_word = Word("centralise")
 
     while True:
@@ -227,12 +271,16 @@ if __name__ == "__main__":
 
         guess_html = input("What was the result? Enter the HTML of the div with class 'guess': ")
         rules = parse_guess_results(guess_html)
+
         remaining_words_before_count = len(remaining_words)
         remaining_words = filter_words(remaining_words, rules)
         print(f"Remaining words filtered from {remaining_words_before_count} to {len(remaining_words)}")
         if len(remaining_words) < 10:
             print(remaining_words)
 
+        # Prioritize picking a word from `remaining_words`` if it can achieve
+        # the same or better results than a word from `all_words` since it
+        # gives us a better chance of guessing the exact word.
         remaining_word_guess, remaining_word_score = get_next_guess(remaining_words, remaining_words)
         all_words_guess, all_words_score = get_next_guess(all_words, remaining_words)
         guess_word = all_words_guess if all_words_score < remaining_word_score else remaining_word_guess
