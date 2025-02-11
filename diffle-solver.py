@@ -22,6 +22,7 @@ The algorithm works by simulating what feedback each potential guess would produ
 #!/usr/bin/env python3
 import csv
 import collections
+import re
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor
 from bs4 import BeautifulSoup
@@ -83,6 +84,16 @@ class LetterEndRule(Rule):
 
     def __repr__(self):
         return f"LetterEndRule({self.letter})"
+
+class RegexRule(Rule):
+    def __init__(self, regex: re.Pattern):
+        self.regex = regex
+
+    def matches(self, word: Word) -> bool:
+        return bool(self.regex.fullmatch(word.word))
+
+    def __repr__(self):
+        return f"RegexRule({self.regex})"
 
 # -------------------------
 # File and Word List Processing
@@ -208,12 +219,16 @@ def parse_guess_results(html: str) -> list:
     soup = BeautifulSoup(html, 'html.parser')
     rules = []
     occurrence_count = collections.Counter()
+    regex_parts = []
+    found_end = False
+
     for letter_div in soup.find_all(class_="letter"):
         letter = letter_div.get_text()
         classes = set(letter_div.get("class", []))
 
         if "absent" in classes:
-            # Check equal to 0 as well so we explicitly set a 0 count for the letter, which will allow us to create a rule for it later.
+            # Check equal to 0 as well so we explicitly set a 0 count for the letter, which will allow us to create a
+            # rule for it later.
             if occurrence_count[letter] >= 0:
               # Use negative occurrence to mark that the occurrence count is an exact count (cannot be more).
               occurrence_count[letter] = -occurrence_count[letter]
@@ -224,18 +239,28 @@ def parse_guess_results(html: str) -> list:
             rules.append(LetterStartRule(letter))
         if "end" in classes:
             rules.append(LetterEndRule(letter))
+            found_end = True
 
-        # TODO: handle positional information (present, head, tail)
-        # if "present" in classes:
-        # if "head" in classes:
-        #     if len(possible_sequence > 0):
-        #         regex_filters.append(f"{re.escape(possible_sequence)}")
-        #     possible_sequence = letter
-        # elif "tail" in classes:
-        #     possible_sequence = f"{possible_sequence}{letter}"
+        if "head" in classes:
+            # TODO: handle case where the "head" immediately follows a "head" or "tail", in which case we know that
+            # there is some other letter that comes in between, so can use '.+' instead of '.*'
+            regex_parts.append(f'.*{letter}')
+        if "tail" in classes:
+            regex_parts.append(letter)
+        if "present" in classes:
+            # TODO: handle "present" case where the letter exists but is in the wrong order
+            # TODO: handle case where "present" is next to "head" or "tail" since you know this letter cannot be next to those letters in the final answer
+            pass
 
     for letter, count in occurrence_count.items():
         rules.append(LetterOccurrenceRule(letter, abs(count), exact=(count <= 0)))
+
+    if not found_end:
+        regex_parts.append(r'.+')
+    if len(regex_parts) > 0:
+        regex_pattern = ''.join(regex_parts)
+        print(f'[debug] RegexRule regex: {regex_pattern}')
+        rules.append(RegexRule(re.compile(regex_pattern)))
 
     return rules
 
@@ -275,7 +300,7 @@ if __name__ == "__main__":
         remaining_words_before_count = len(remaining_words)
         remaining_words = filter_words(remaining_words, rules)
         print(f"Remaining words filtered from {remaining_words_before_count} to {len(remaining_words)}")
-        if len(remaining_words) < 10:
+        if len(remaining_words) < 20:
             print(remaining_words)
 
         # Prioritize picking a word from `remaining_words`` if it can achieve
